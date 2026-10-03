@@ -1,1 +1,276 @@
+name: build-apk
 
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform 34
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Scaffold Android project
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/java/com/abab/wifiaudit
+
+          cat > settings.gradle <<'__K_END_SETTINGS__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "WifiAudit"
+          include ":app"
+          __K_END_SETTINGS__
+
+          cat > build.gradle <<'__K_END_ROOT_BUILD__'
+          plugins {
+              id 'com.android.application' version '8.4.0' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          __K_END_ROOT_BUILD__
+
+          cat > gradle.properties <<'__K_END_PROPS__'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          __K_END_PROPS__
+
+          cat > local.properties <<'__K_END_LOCAL__'
+          __K_END_LOCAL__
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+          cat > app/build.gradle <<'__K_END_APP_BUILD__'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.abab.wifiaudit'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.abab.wifiaudit"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes {
+                  release { signingConfig signingConfigs.debug }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+              implementation 'androidx.core:core-ktx:1.13.1'
+              implementation 'com.google.android.material:material:1.12.0'
+              implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+          }
+          __K_END_APP_BUILD__
+
+          cat > app/src/main/AndroidManifest.xml <<'__K_END_MANIFEST__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:label="WiFi Audit"
+                  android:theme="@style/Theme.MaterialComponents.DayNight.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __K_END_MANIFEST__
+
+          cat > app/src/main/java/com/abab/wifiaudit/Cracker.kt <<'__K_END_CRACKER__'
+          package com.abab.wifiaudit
+
+          import java.util.concurrent.ArrayBlockingQueue
+          import java.util.concurrent.Future
+          import java.util.concurrent.ThreadPoolExecutor
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicBoolean
+          import java.util.concurrent.atomic.AtomicLong
+          import java.util.concurrent.atomic.AtomicReference
+          import javax.crypto.Mac
+          import javax.crypto.SecretKeyFactory
+          import javax.crypto.spec.PBEKeySpec
+          import javax.crypto.spec.SecretKeySpec
+
+          object Cracker {
+
+              sealed class Hash {
+                  data class Pmkid(
+                      val pmkid: ByteArray, val ssid: ByteArray,
+                      val apMac: ByteArray, val staMac: ByteArray,
+                  ) : Hash()
+                  data class Eapol(
+                      val mic: ByteArray, val ssid: ByteArray,
+                      val apMac: ByteArray, val staMac: ByteArray,
+                      val aNonce: ByteArray, val eapol: ByteArray,
+                  ) : Hash()
+              }
+
+              fun parse22000(line: String): Hash? {
+                  val p = line.trim().split("*")
+                  if (p.size < 6 || p[0] != "WPA") return null
+                  return try {
+                      when (p[1]) {
+                          "01" -> Hash.Pmkid(
+                              pmkid  = hex(p[2]),
+                              apMac  = hex(p[3]),
+                              staMac = hex(p[4]),
+                              ssid   = hex(p[5]),
+                          )
+                          "02" -> {
+                              if (p.size < 8) return null
+                              Hash.Eapol(
+                                  mic    = hex(p[2]),
+                                  apMac  = hex(p[3]),
+                                  staMac = hex(p[4]),
+                                  ssid   = hex(p[5]),
+                                  aNonce = hex(p[6]),
+                                  eapol  = hex(p[7]),
+                              )
+                          }
+                          else -> null
+                      }
+                  } catch (_: Throwable) { null }
+              }
+
+              fun crack(
+                  hash: Hash,
+                  words: Sequence<String>,
+                  workers: Int = Runtime.getRuntime().availableProcessors().coerceIn(1, 4),
+                  onProgress: ((Long) -> Unit)? = null,
+              ): String? {
+                  val skf = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1")
+
+                  val prfData: ByteArray = when (hash) {
+                      is Hash.Pmkid -> {
+                          val l = "PMK Name".toByteArray(Charsets.US_ASCII)
+                          ByteArray(l.size + 12).also {
+                              System.arraycopy(l, 0, it, 0, l.size)
+                              System.arraycopy(hash.apMac,  0, it, l.size, 6)
+                              System.arraycopy(hash.staMac, 0, it, l.size + 6, 6)
+                          }
+                      }
+                      is Hash.Eapol -> {
+                          val sNonce = hash.eapol.copyOfRange(17, 49)
+                          val apSta  = if (cmp(hash.apMac, hash.staMac) < 0)
+                              hash.apMac + hash.staMac else hash.staMac + hash.apMac
+                          val nonces = if (cmp(hash.aNonce, sNonce) < 0)
+                              hash.aNonce + sNonce else sNonce + hash.aNonce
+                          apSta + nonces
+                      }
+                  }
+
+                  val found  = AtomicBoolean(false)
+                  val tried  = AtomicLong(0)
+                  val result = AtomicReference<String?>(null)
+
+                  fun test(candidate: String): Boolean {
+                      val pmk = skf.generateSecret(
+                          PBEKeySpec(candidate.toCharArray(), hash.ssid, 4096, 256)
+                      ).encoded
+                      val mac = Mac.getInstance("HmacSHA1")
+                      return when (hash) {
+                          is Hash.Pmkid -> {
+                              mac.init(SecretKeySpec(pmk, "HmacSHA1"))
+                              val full = mac.doFinal(prfData)
+                              var ok = true
+                              for (i in 0 until 16) if (full[i] != hash.pmkid[i]) { ok = false; break }
+                              ok
+                          }
+                          is Hash.Eapol -> {
+                              val kck = prf512(pmk, prfData).copyOfRange(0, 16)
+                              mac.init(SecretKeySpec(kck, "HmacSHA1"))
+                              val full = mac.doFinal(hash.eapol)
+                              var ok = true
+                              for (i in 0 until 16) if (full[i] != hash.mic[i]) { ok = false; break }
+                              ok
+                          }
+                      }
+                  }
+
+                  val executor = ThreadPoolExecutor(
+                      workers, workers, 0L, TimeUnit.MILLISECONDS,
+                      ArrayBlockingQueue(workers * 4),
+                  )
+
+                  fun process(chunk: List<String>) {
+                      for (c in chunk) {
+                          if (found.get()) return
+                          tried.incrementAndGet()
+                          if (test(c) && found.compareAndSet(false, true)) {
+                              result.set(c); return
+                          }
+                      }
+                      onProgress?.invoke(tried.get())
+                  }
+
+                  val futures = ArrayDeque<Future<*>>()
+                  val batch = ArrayList<String>(128)
+                  fun flush() {
+                      if (batch.isEmpty()) return
+                      val copy = ArrayList(batch); batch.clear()
+                      futures.addLast(executor.submit { process(copy) })
+                      while (futures.size >= workers * 4) futures.removeFirst().get()
+                  }
+
+                  try {
+                      for (w in words) {
+                          if (found.get()) break
+                          batch.add(w)
+                          if (batch.size >= 128) flush()
+                      }
+                      if (!found.get()) flush()
+                      while (futures.isNotEmpty()) futures.removeFirst().get()
+                  } finally {
+                      executor.shutdownNow()
+                  }
+                  return result.get()
+              }
+
+              private fun prf512(pmk: ByteArray, data: ByteArray): ByteArray {
+                  val label = "Pairwise key expansion".toByteArray(Charsets.US_ASCII)
+                  val mac = Mac.getInstance("HmacSHA1")
+                  mac.init(SecretKeySpec(pmk, "HmacSHA1"))
+                  fun h(x: ByteArray): ByteArray { mac.reset(); return mac.doFinal(x) }
+
+                  val seed = ByteArray(label.size + 1 + data.size + 1)
+                  System.arraycopy(label, 0, seed, 0, label.size)
+                  seed[label.size] = 0
+                  System.arraycopy(data, 0, seed, label.size + 1, data.size)
+                  seed[seed.size - 1] = 1
+
+                  var a = h(seed)
+                  val out = ByteArray(64)
+                  var off = 0
+                  var i: Byte = 1
+                 
